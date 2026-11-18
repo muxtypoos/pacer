@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Charge Pacer</title>
+<style>
+:root{--bg:#0e0f11;--card:#17191c;--line:#2a2d31;--tx:#e8eaed;--mu:#8a8f96;--ac:#e31937;--ok:#3fb950;--wa:#d29922}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx);padding:16px;max-width:420px;margin:auto}
+h1{font-size:17px;font-weight:600;margin:0 0 12px;display:flex;justify-content:space-between;align-items:center}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+button{font:inherit;border:0;border-radius:9px;padding:11px;width:100%;cursor:pointer;background:#2a2d31;color:var(--tx)}
+button.pri{background:var(--ac);color:#fff;font-weight:600}
+button.on{background:var(--ok);color:#04160a;font-weight:600}
+button:disabled{opacity:.4;cursor:default}
+.row{display:flex;justify-content:space-between;align-items:center;padding:6px 0}
+.row label{color:var(--mu)}
+input{font:inherit;width:96px;text-align:right;background:#0e0f11;color:var(--tx);border:1px solid var(--line);border-radius:7px;padding:7px 9px}
+input.wide{width:100%;text-align:left;margin-top:4px}
+.big{font-size:52px;font-weight:700;text-align:center;letter-spacing:-1px}
+.big small{font-size:20px;color:var(--mu);font-weight:500}
+.sub{text-align:center;color:var(--mu);font-size:13px}
+.warn{color:var(--wa)} .good{color:var(--ok)}
+#status{font-size:13px;color:var(--mu);margin-top:8px;min-height:18px;text-align:center}
+details summary{color:var(--mu);cursor:pointer;font-size:13px}
+.gear{width:auto;padding:4px 10px;background:none;color:var(--mu);font-size:18px}
+.f{display:block;margin:8px 0;color:var(--mu);font-size:13px}
+</style>
+</head>
+<body>
+<h1>Charge Pacer <button class="gear" id="gear" title="API settings">⚙</button></h1>
+
+<div class="card">
+  <button id="act" class="pri">Activate auto (Tesla API)</button>
+  <div id="status">API not configured — manual mode</div>
+</div>
+
+<div class="card" id="cfg" hidden>
+  <label class="f">Fleet API base URL (data)<input class="wide" id="apiBase"></label>
+  <label class="f">Command URL (tesla-http-proxy, signs commands)<input class="wide" id="cmdBase"></label>
+  <label class="f">Access token<input class="wide" id="token" type="password" autocomplete="off"></label>
+  <label class="f">VIN<input class="wide" id="vin" autocomplete="off"></label>
+  <button id="saveCfg">Save</button>
+</div>
+
+<div class="card">
+  <div class="row"><label>Current charge (%)</label><input id="cur" type="number" min="0" max="100" value="50"></div>
+  <div class="row"><label>Charge target (%)</label><input id="tgt" type="number" min="1" max="100" value="80"></div>
+  <div class="row"><label>Voltage (V)</label><input id="volt" type="number" min="100" max="260" value="230"></div>
+  <div class="row"><label>Target time (h)</label><input id="hrs" type="number" min="0.5" max="24" step="0.25" value="6"></div>
+  <details>
+    <summary>Advanced</summary>
+    <div class="row"><label>Usable capacity (kWh)</label><input id="cap" type="number" step="0.5" value="75"></div>
+    <div class="row"><label>Charging efficiency (%)</label><input id="eff" type="number" min="50" max="100" value="90"></div>
+    <div class="row"><label>Phases</label><input id="ph" type="number" min="1" max="3" step="2" value="1"></div>
+    <div class="row"><label>Max amps</label><input id="max" type="number" min="5" max="48" value="32"></div>
+  </details>
+</div>
+
+<div class="card">
+  <div class="big" id="amps">–<small> A</small></div>
+  <div class="sub" id="detail"></div>
+  <div style="height:12px"></div>
+  <button id="send" disabled>Send amperage to car</button>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const MIN_A=5, store={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+const DEF={apiBase:'https://fleet-api.prd.eu.vn.cloud.tesla.com',cmdBase:'',token:'',vin:''};
+const cfg={};for(const k in DEF){cfg[k]=store.get('cp_'+k)??DEF[k];$(k).value=cfg[k]}
+['cap','eff','ph','max'].forEach(k=>{const v=store.get('cp_'+k);if(v)$(k).value=v});
+let result=null, auto=false;
+const ready=()=>cfg.token&&cfg.vin&&cfg.apiBase;
+const status=(t,c='')=>{$('status').textContent=t;$('status').className=c};
+
+/* ---------- calculation ---------- */
+function calc(){
+  const n=id=>parseFloat($(id).value);
+  const cur=n('cur'),tgt=n('tgt'),V=n('volt'),h=n('hrs'),cap=n('cap'),eff=n('eff')/100,ph=n('ph')>=2?3:1,maxA=n('max');
+  if([cur,tgt,V,h,cap,eff,maxA].some(isNaN)||h<=0||V<=0){result=null;return render('Check inputs')}
+  const kWh=Math.max(0,(tgt-cur)/100*cap);
+  if(kWh===0){result=null;return render('Already at or above target')}
+  const kWperA=V*ph*eff/1000;                 // battery kW per amp
+  const exact=kWh/(h*kWperA);                 // amps for exactly h hours
+  let A=Math.ceil(exact), note='';            // round up → slightly under target time
+  if(A<MIN_A){A=MIN_A;note='Below Tesla minimum (5 A) — will finish early'}
+  if(A>maxA){A=maxA;note='Max amps can\'t reach target time'}
+  const t=kWh/(A*kWperA);
+  result={A,kWh,t};
+  const fin=new Date(Date.now()+t*3600e3).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  render(`${kWh.toFixed(1)} kWh · ${(A*V*ph/1000).toFixed(2)} kW from grid<br>≈ ${Math.floor(t)} h ${String(Math.round(t%1*60)).padStart(2,'0')} min · done ~${fin} if started now`+(note?`<br><span class="warn">${note}</span>`:''));
+}
+function render(d){
+  $('amps').innerHTML=(result?result.A:'–')+'<small> A</small>';
+  $('detail').innerHTML=d; $('send').disabled=!(result&&ready());
+}
+document.querySelectorAll('input[type=number]').forEach(i=>i.addEventListener('input',()=>{
+  if(['cap','eff','ph','max'].includes(i.id))store.set('cp_'+i.id,i.value);calc()}));
+
+/* ---------- Tesla Fleet API ---------- */
+// Uses native HTTP inside Capacitor (no CORS); fetch elsewhere (needs a CORS-enabled proxy).
+async function api(method,base,path,body){
+  const url=base.replace(/\/$/,'')+path, headers={'Authorization':'Bearer '+cfg.token,'Content-Type':'application/json'};
+  const ch=window.Capacitor?.Plugins?.CapacitorHttp;
+  if(ch){const r=await ch.request({url,method,headers,data:body});return{status:r.status,json:typeof r.data==='string'?JSON.parse(r.data||'{}'):r.data}}
+  const r=await fetch(url,{method,headers,body:body?JSON.stringify(body):undefined});
+  return{status:r.status,json:await r.json().catch(()=>({}))};
+}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function chargeState(){
+  const p=`/api/1/vehicles/${cfg.vin}/vehicle_data?endpoints=charge_state`;
+  for(let i=0;i<8;i++){
+    const r=await api('GET',cfg.apiBase,p);
+    if(r.status===200)return r.json.response.charge_state;
+    if(r.status===408){status('Waking car…');if(i===0)await api('POST',cfg.apiBase,`/api/1/vehicles/${cfg.vin}/wake_up`);await sleep(5000);continue}
+    throw new Error('vehicle_data '+r.status+' '+(r.json.error||''));
+  }
+  throw new Error('Car did not wake');
+}
+async function syncFromCar(){
+  status('Reading car…');
+  const cs=await chargeState();
+  $('cur').value=cs.battery_level;
+  $('tgt').value=cs.charge_limit_soc;
+  if(cs.charger_voltage>100)$('volt').value=cs.charger_voltage;      // only valid while charging
+  if(cs.charger_phases)$('ph').value=cs.charger_phases>=2?3:1;
+  if(cs.charge_current_request_max)$('max').value=cs.charge_current_request_max;
+  calc(); return cs;
+}
+async function sendAmps(){
+  if(!result)return;
+  const A=result.A; status(`Sending ${A} A…`); $('send').disabled=true;
+  try{
+    const r=await api('POST',cfg.cmdBase||cfg.apiBase,`/api/1/vehicles/${cfg.vin}/command/set_charging_amps`,{charging_amps:A});
+    const ok=r.status===200&&r.json.response?.result!==false;
+    if(!ok)throw new Error((r.json.response?.reason||r.json.error||'HTTP '+r.status));
+    await sleep(2000);
+    const cs=await chargeState();                                       // read-back check
+    cs.charge_current_request===A?status(`Car confirms ${A} A ✓`,'good'):status(`Sent ${A} A, car reports ${cs.charge_current_request} A — retry`,'warn');
+  }catch(e){status('Send failed: '+e.message+' — tap Send to retry','warn')}
+  $('send').disabled=!(result&&ready());
+}
+
+/* ---------- UI ---------- */
+$('gear').onclick=()=>$('cfg').hidden=!$('cfg').hidden;
+$('saveCfg').onclick=()=>{for(const k in DEF){cfg[k]=$(k).value.trim();store.set('cp_'+k,cfg[k])}
+  $('cfg').hidden=true;status(ready()?'API configured — tap Activate':'API not configured — manual mode');calc()};
+$('send').onclick=sendAmps;
+$('act').onclick=async()=>{
+  if(!ready()){$('cfg').hidden=false;return status('Add token + VIN first','warn')}
+  auto=!auto; $('act').className=auto?'on':'pri'; $('act').textContent=auto?'Auto active — tap to stop':'Activate auto (Tesla API)';
+  if(!auto)return status('Auto off — manual mode');
+  try{await syncFromCar();await sendAmps()}catch(e){status(e.message,'warn')}
+};
+if(ready())status('API configured — tap Activate');
+calc();
+</script>
+</body>
+</html>
